@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import re
+import socket
 import ssl
 import stat
 import subprocess
@@ -17,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from urllib.parse import urlsplit
 from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener
+
+__version__ = '0.0.0-dev'
 
 LOG = logging.getLogger('add_blocked')
 CONFIG_FILE = 'add_blocked.conf'
@@ -28,6 +31,10 @@ ROW_ID = re.compile(r'\*[0-9a-fA-F]+\Z')
 
 
 class ToolError(Exception):
+    pass
+
+
+class MissingConfigError(ToolError):
     pass
 
 
@@ -62,7 +69,7 @@ def get_credentials(config_file=CONFIG_FILE):
             mode = os.fstat(stream.fileno()).st_mode
             config.read_file(stream)
     except FileNotFoundError:
-        pass
+        raise MissingConfigError(os.path.abspath(config_file)) from None
     except (OSError, UnicodeError, configparser.Error) as exc:
         raise ToolError(f'Cannot read configuration ({type(exc).__name__})') from None
 
@@ -185,14 +192,24 @@ def read_address_list(api, list_name):
     return rows
 
 
+def resolve_worker(domain):
+    try:
+        socket.getaddrinfo(domain, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return 1
+    return 0
+
+
 def resolve_task(domain, timeout):
     if is_ip_entry(domain):
         return True
     try:
+        command = [__compiled__.process_exe, '--_resolve', domain]
+    except NameError:
+        command = [sys.executable, '-I', os.path.abspath(__file__), '--_resolve', domain]
+    try:
         result = subprocess.run(
-            [sys.executable, '-I', '-c',
-             'import socket, sys; socket.getaddrinfo(sys.argv[1], None, proto=socket.IPPROTO_TCP)', domain],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=timeout, check=False,
         )
     except subprocess.TimeoutExpired:
@@ -332,8 +349,9 @@ def connect_router(args):
     return api
 
 
-def parse_args(argv=None):
+def build_parser(argv=None):
     parser = argparse.ArgumentParser(description='MikroTik IPv4 firewall address-list tool')
+    parser.add_argument('--version', action='version', version=__version__)
     parser.add_argument('sites', nargs='*', help='DNS names, IPv4 addresses, networks or ranges')
     parser.add_argument('-f', '--file', help='Local file or HTTP(S) URL with one entry per line')
     parser.add_argument('--source-timeout', type=positive_float, default=10.0)
@@ -352,7 +370,11 @@ def parse_args(argv=None):
     parser.add_argument('--resolve-workers', type=bounded_int(1, 128), default=32)
     config_file = CONFIG_FILE
     if os.name == 'nt' and argv == []:
-        config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE)
+        try:
+            program_dir = __compiled__.containing_dir
+        except NameError:
+            program_dir = os.path.dirname(os.path.abspath(__file__))
+        config_file = os.path.join(program_dir, CONFIG_FILE)
     parser.add_argument('--config', default=config_file)
     parser.add_argument('--api-timeout', type=positive_float, default=10.0)
     parser.add_argument('--api-port', type=bounded_int(1, 65535))
@@ -361,6 +383,11 @@ def parse_args(argv=None):
     transport.add_argument('--api-ssl', action='store_true', help='Use API-SSL with certificate verification')
     parser.add_argument('--api-ca-file', help='Trusted CA certificate file for RouterOS TLS')
     parser.add_argument('--debug', action='store_true')
+    return parser
+
+
+def parse_args(argv=None):
+    parser = build_parser(argv)
     args = parser.parse_args(argv)
     if not args.addr_list.strip() or not args.addr_list.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in args.addr_list):
         parser.error('--addr-list must be a non-empty ASCII list name without control characters')
@@ -379,6 +406,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if not os.path.isfile(args.config):
+        raise MissingConfigError(os.path.abspath(args.config))
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     logging.getLogger('librouteros').setLevel(logging.CRITICAL + 1)
@@ -431,6 +460,8 @@ def main(argv=None):
         else:
             operation = 'Add entries'
             status = add_sites(api, sites, rows, args)
+    except MissingConfigError:
+        raise
     except ToolError as exc:
         LOG.error('%s', exc)
         status = 1
@@ -467,12 +498,48 @@ def restore_windows_console():
         sys.stderr = open('CONOUT$', 'w', encoding='utf-8', buffering=1, errors='backslashreplace')
 
 
+def wait_for_key():
+    if (sys.stdin is None or sys.stdout is None
+            or not sys.stdin.isatty() or not sys.stdout.isatty()):
+        return
+    print('Press any key to exit...', end='', flush=True)
+    try:
+        if os.name == 'nt':
+            import msvcrt
+
+            msvcrt.getwch()
+        else:
+            import termios
+            import tty
+
+            fd = sys.stdin.fileno()
+            settings = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                os.read(fd, 1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, settings)
+    except (EOFError, KeyboardInterrupt, OSError):
+        pass
+    finally:
+        print()
+
+
 def cli(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if len(argv) == 2 and argv[0] == '--_resolve':
+        return resolve_worker(argv[1])
     try:
         if not argv:
             restore_windows_console()
         status = main(argv)
+    except MissingConfigError as exc:
+        print(f'Configuration file not found or not a regular file: {exc}', file=sys.stderr)
+        build_parser(argv).print_help()
+        print('\nCreate the configuration file with the following settings:\n'
+              '[credentials]\nhost = 192.168.88.1\nuser = YOUR_USER\npassword = YOUR_PASSWORD\n')
+        wait_for_key()
+        return 1
     except KeyboardInterrupt:
         status = 130
     except Exception as exc:

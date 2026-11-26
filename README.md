@@ -23,6 +23,26 @@ python add_blocked.py --help
 
 The commands above use a POSIX shell. On Windows, activate the virtual environment using its platform-specific activation script.
 
+## Windows release
+
+Download `add_blocked-windows-x64.exe` or `add_blocked-windows-x64.zip` from the repository's Releases page. The EXE is a Nuitka onefile console application for Windows AMD64 (x86-64); Python and CMD launchers are not required. The ZIP contains the EXE as `add_blocked.exe`, the versioned Python source, configuration example, documentation and build/source files. Copy `add_blocked.conf.example` to `add_blocked.conf`, fill in credentials and place it next to the EXE. Double-click the executable for interactive use.
+
+```powershell
+.\add_blocked.exe --version
+.\add_blocked.exe --help
+```
+
+To publish a release, commit the workflow and push a new Git tag:
+
+```bash
+git tag -a v1.0.0 -m "Release v1.0.0"
+git push origin v1.0.0
+```
+
+`.github/workflows/release.yml` builds using Python 3.13.7 x64, Nuitka 4.3.5 and MSVC on Windows. It embeds the exact tag (including `v` if present), runs unit and EXE smoke tests, then creates a GitHub Release with the EXE and ZIP. Numeric tags also populate the Windows file/product version using up to four numeric components (e.g. `v1.0.0` becomes `1.0.0.0` in file properties). Other tags retain their exact CLI version but do not set numeric version resources. Unbuilt source reports `0.0.0-dev`; the source included in the release ZIP is stamped with the tag. `--version` and `--help` do not require configuration. Existing releases are not overwritten by rerunning the workflow. The repository must permit Actions to write release contents.
+
+The bundled `librouteros` dependency is GPL-2.0-or-later. Before public distribution, ensure the project's license and distribution of corresponding source comply with the dependency's license. The workflow includes its source distribution in the ZIP and does not change the project's license.
+
 ## Configuration
 
 ```bash
@@ -39,6 +59,8 @@ password =
 ```
 
 Provide the actual password through a protected configuration file or the `ADD_BLOCKED_PASSWORD` environment variable injected by a secret manager or scheduler. The three environment variables `ADD_BLOCKED_HOST`, `ADD_BLOCKED_USER` and `ADD_BLOCKED_PASSWORD` override their respective INI values, including empty values. All three settings must be non-empty. Credentials must be ASCII; the host must be a hostname or IP address without a port or URL scheme. Passwords are not interpolated. On POSIX, a configuration file containing a password must not grant any group or other permissions (use `chmod 600`). Do not commit secrets or print the environment in CI. On Windows, restrict file access with ACLs.
+
+A local configuration file is required even when credentials are supplied through environment variables. If the selected file does not exist or is not a regular file, the program prints its path, the CLI help and an INI example before reading any input or connecting to RouterOS. In an interactive terminal it waits for a single key press (no Enter required) and exits with status 1. With redirected input or output it exits immediately. `--help` works without a configuration file.
 
 The default connection uses the original unencrypted RouterOS API (TCP 8728). No SSL configuration is required. Use it only on a trusted, restricted management network because credentials are transmitted without encryption. To enable verified TLS, use `--api-ssl`. For a private CA, supply its trusted certificate:
 
@@ -81,7 +103,7 @@ Without entries or a file, add/delete mode prompts for a single line of space-se
 python add_blocked.py
 ```
 
-When launched without arguments in an interactive terminal, the program waits for Enter after completion, including errors. Ctrl+C during processing exits without this pause. Invocations with arguments and redirected standard input or output do not pause; the original exit status is preserved.
+When launched without arguments in an interactive terminal, the program waits for Enter after completion, including errors. Ctrl+C during processing exits without this pause. Invocations with arguments do not pause after normal processing; the missing-configuration prompt described above is the exception. Redirected standard input or output never pauses; the original exit status is preserved.
 
 On Windows, double-click `add_blocked.py` directly using Python 3.10 or newer. No CMD launcher is required. If Python starts without standard console streams, the script restores the missing streams and allocates a console when necessary. A Windows launch without arguments reads the default `add_blocked.conf` from the script directory; invocations with arguments retain the working-directory default unless `--config` is supplied. If the file association prevents Python itself from starting, the script cannot repair it.
 
@@ -113,6 +135,7 @@ An empty file exits successfully without connecting. `--list`, `--delete` and `-
 | `--api-ssl` | off | Enable verified RouterOS TLS |
 | `--api-ca-file` | system trust | CA file for RouterOS TLS |
 | `--debug` | off | Verbose diagnostic logging |
+| `--version` | — | Show the build version |
 | `-h, --help` | — | Help |
 
 ## Cleanup safety

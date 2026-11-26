@@ -1,0 +1,170 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Python x64
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13.7'
+          architecture: x64
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt Nuitka==4.3.5
+
+      - name: Set release version
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path('add_blocked.py')
+          source = path.read_text(encoding='utf-8')
+          marker = "__version__ = '0.0.0-dev'"
+          if source.count(marker) != 1:
+              raise SystemExit('Expected exactly one development version marker')
+          path.write_text(source.replace(marker, '__version__ = ' + ascii(os.environ['GITHUB_REF_NAME']), 1), encoding='utf-8')
+          PY
+
+      - name: Test source
+        run: |
+          python -m py_compile add_blocked.py
+          python -m unittest discover -s tests -v
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          version = subprocess.check_output([sys.executable, 'add_blocked.py', '--version'], text=True).strip()
+          if version != os.environ['GITHUB_REF_NAME']:
+              raise SystemExit('Source version does not match the tag')
+          PY
+
+      - name: Build Windows x64 executable
+        run: |
+          version=$(python - <<'PY'
+          import os
+          import re
+
+          match = re.fullmatch(r'v?(\d{1,5}(?:\.\d{1,5}){0,3})(?:[-+].*)?', os.environ['GITHUB_REF_NAME'])
+          if match:
+              parts = [int(part) for part in match[1].split('.')]
+              if all(part <= 65535 for part in parts):
+                  print('.'.join(map(str, parts + [0] * (4 - len(parts)))), end='')
+          PY
+          )
+          version_args=()
+          if [[ -n "$version" ]]; then
+            version_args=("--file-version=$version" "--product-version=$version")
+          fi
+          python -m nuitka \
+            --mode=onefile \
+            --onefile-no-dll \
+            --msvc=latest \
+            --assume-yes-for-downloads \
+            --windows-console-mode=force \
+            --output-dir=dist \
+            --output-filename=add_blocked-windows-x64.exe \
+            --product-name=add_blocked \
+            "${version_args[@]}" \
+            add_blocked.py
+
+      - name: Test Windows executable
+        run: |
+          python - <<'PY'
+          import os
+          import struct
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          exe = Path('dist/add_blocked-windows-x64.exe').resolve()
+          with exe.open('rb') as stream:
+              if stream.read(2) != b'MZ':
+                  raise SystemExit('Not a Windows executable')
+              stream.seek(0x3c)
+              pe_offset = struct.unpack('<I', stream.read(4))[0]
+              stream.seek(pe_offset)
+              if stream.read(4) != b'PE\0\0' or struct.unpack('<H', stream.read(2))[0] != 0x8664:
+                  raise SystemExit('Expected a Windows AMD64 executable')
+
+          with tempfile.TemporaryDirectory() as directory:
+              def run(*args):
+                  return subprocess.run([str(exe), *args], cwd=directory, input='', capture_output=True,
+                                        text=True, encoding='utf-8', timeout=60)
+
+              result = run('--version')
+              if result.returncode != 0 or result.stdout.strip() != os.environ['GITHUB_REF_NAME']:
+                  raise SystemExit(f'EXE version test failed: {result}')
+              result = run('--help')
+              if result.returncode != 0 or '--version' not in result.stdout:
+                  raise SystemExit(f'EXE help test failed: {result}')
+              result = run()
+              if result.returncode != 1 or str(exe.parent / 'add_blocked.conf') not in result.stderr or 'usage:' not in result.stdout:
+                  raise SystemExit(f'EXE missing config test failed: {result}')
+              result = run('--_resolve', 'localhost')
+              if result.returncode != 0:
+                  raise SystemExit(f'EXE DNS worker test failed: {result}')
+          PY
+
+      - name: Package release
+        run: |
+          python -m pip download --no-deps --no-binary=librouteros -r requirements.txt --dest release-sources
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          dist = Path('dist')
+          with ZipFile(dist / 'add_blocked-windows-x64.zip', 'w', compression=ZIP_DEFLATED) as archive:
+              archive.write(dist / 'add_blocked-windows-x64.exe', 'add_blocked.exe')
+              for name in ('add_blocked.py', 'add_blocked.conf.example', 'requirements.txt',
+                           'README.md', 'README.ru.md', 'tests/test_add_blocked.py', '.github/workflows/release.yml'):
+                  archive.write(name)
+              for name in ('LICENSE', 'LICENSE.txt', 'LICENSE.md', 'COPYING'):
+                  if Path(name).is_file():
+                      archive.write(name)
+              python_license = Path(sys.base_prefix) / 'LICENSE.txt'
+              if python_license.is_file():
+                  archive.write(python_license, 'licenses/Python-LICENSE.txt')
+              for path in sorted(Path('release-sources').iterdir()):
+                  if path.is_file():
+                      archive.write(path, 'sources/' + path.name)
+          with ZipFile(dist / 'add_blocked-windows-x64.zip') as archive:
+              if archive.testzip() is not None:
+                  raise SystemExit('ZIP integrity check failed')
+          PY
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create --verify-tag --generate-notes --title "$GITHUB_REF_NAME" -- \
+            "$GITHUB_REF_NAME" \
+            dist/add_blocked-windows-x64.exe \
+            dist/add_blocked-windows-x64.zip
