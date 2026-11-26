@@ -74,7 +74,13 @@ example.net
 
 Blank lines and full-line `#` comments are ignored. Local files use UTF-8 (BOM accepted); HTTP(S) sources use the declared charset or UTF-8. Invalid input aborts before router writes. Names are lowercased, a final DNS dot is removed, internationalized names are converted using Python's built-in IDNA codec, and IPv4 networks are normalized to their network address (a `/32` becomes a single IP). Duplicates are removed while preserving input order. IPv6, URLs as entries, wildcard domains and hosts-file syntax are not supported. The script does not create firewall rules; an existing firewall rule must reference the list to enforce filtering.
 
-Without entries or a file, add/delete mode prompts only on an interactive terminal. An empty file exits successfully without connecting. `--list`, `--delete` and `--clean` are mutually exclusive; listing and cleanup do not accept input entries.
+Without entries or a file, add/delete mode prompts for a single line of space-separated addresses, including when standard input is redirected. Enter `example.org example.net` to add entries or `-d example.org example.net` to delete them. An empty line exits successfully; end-of-file without input exits with status 1. For example:
+
+```bash
+python add_blocked.py
+```
+
+An empty file exits successfully without connecting. `--list`, `--delete` and `--clean` are mutually exclusive; listing and cleanup do not accept input entries.
 
 ## Options
 

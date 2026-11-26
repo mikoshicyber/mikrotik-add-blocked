@@ -368,9 +368,10 @@ def main(argv=None):
             if args.file:
                 LOG.info('No input entries')
                 return 0
-            if not sys.stdin.isatty():
-                raise ToolError('No input entries; supply addresses or --file')
-            entries = input('Enter addresses; add -d to delete:\n').split()
+            try:
+                entries = input('Enter domains. Add -d to delete.\n').split()
+            except EOFError:
+                raise ToolError('No input entries; supply addresses or --file') from None
             args.delete = args.delete or '-d' in entries
             args.sites = [entry for entry in entries if entry != '-d']
             if not args.sites:
