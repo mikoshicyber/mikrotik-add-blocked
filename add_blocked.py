@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 import argparse
@@ -123,13 +123,28 @@ def normalize_address(value):
     return value
 
 
-def normalize_sites(sites):
+def interactive_address(value):
+    if '://' not in value:
+        return value
+    if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError('invalid URL')
+    parsed = urlsplit(value)
+    if (parsed.scheme not in ('http', 'https') or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or any(c in parsed.netloc for c in '\\[]')):
+        raise ValueError('invalid HTTP(S) URL')
+    if parsed.netloc.endswith(':') or parsed.port == 0:
+        raise ValueError('invalid URL port')
+    return parsed.hostname
+
+
+def normalize_sites(sites, *, allow_urls=False):
     result = {}
     for index, site in enumerate(sites, 1):
         if index > MAX_ENTRIES:
             raise ToolError(f'Input exceeds {MAX_ENTRIES} entries')
         try:
-            result[normalize_address(site)] = None
+            result[normalize_address(interactive_address(site) if allow_urls else site)] = None
         except (ValueError, UnicodeError):
             raise ToolError(f'Invalid address at input entry {index}') from None
     return list(result)
@@ -305,13 +320,14 @@ def connect_router(args):
         raise ToolError('Missing dependency: install requirements.txt') from None
     host, user, password = get_credentials(args.config)
     options = dict(host=host, username=user, password=password, timeout=args.api_timeout,
-                   port=args.api_port or (8728 if args.api_plain else 8729))
-    if args.api_plain:
-        LOG.warning('Using unencrypted RouterOS API; restrict access to a trusted management network')
-    else:
+                   port=args.api_port or (8729 if args.api_ssl else 8728))
+    if args.api_ssl:
         context = ssl.create_default_context(cafile=args.api_ca_file)
         options['ssl_wrapper'] = partial(context.wrap_socket, server_hostname=host)
-    api = connect(**options)
+    try:
+        api = connect(**options)
+    except Exception as exc:
+        raise ToolError(f'Cannot connect to RouterOS ({type(exc).__name__})') from None
     LOG.info('Connected to RouterOS')
     return api
 
@@ -334,10 +350,15 @@ def parse_args(argv=None):
     parser.add_argument('--bulk-size', type=bounded_int(1, 1000), default=50)
     parser.add_argument('--resolve-timeout', type=nonnegative_float, default=0.0)
     parser.add_argument('--resolve-workers', type=bounded_int(1, 128), default=32)
-    parser.add_argument('--config', default=CONFIG_FILE)
+    config_file = CONFIG_FILE
+    if os.name == 'nt' and argv == []:
+        config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE)
+    parser.add_argument('--config', default=config_file)
     parser.add_argument('--api-timeout', type=positive_float, default=10.0)
     parser.add_argument('--api-port', type=bounded_int(1, 65535))
-    parser.add_argument('--api-plain', action='store_true', help='Use legacy unencrypted API explicitly')
+    transport = parser.add_mutually_exclusive_group()
+    transport.add_argument('--api-plain', action='store_true', help='Use unencrypted API (default)')
+    transport.add_argument('--api-ssl', action='store_true', help='Use API-SSL with certificate verification')
     parser.add_argument('--api-ca-file', help='Trusted CA certificate file for RouterOS TLS')
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args(argv)
@@ -351,6 +372,8 @@ def parse_args(argv=None):
         parser.error('--clean and --list do not accept input entries')
     if args.api_plain and args.api_ca_file:
         parser.error('--api-ca-file cannot be used with --api-plain')
+    if args.api_ca_file:
+        args.api_ssl = True
     return args
 
 
@@ -361,23 +384,27 @@ def main(argv=None):
     logging.getLogger('librouteros').setLevel(logging.CRITICAL + 1)
     api = None
     status = 0
+    operation = 'Read input'
     try:
         if args.file:
             args.sites.extend(read_sites_from_source(args.file, args))
-        if not args.sites and not (args.list or args.clean):
+        interactive = not args.sites and not (args.list or args.clean)
+        if interactive:
             if args.file:
                 LOG.info('No input entries')
                 return 0
             try:
-                entries = input('Enter domains. Add -d to delete.\n').split()
+                entries = input('Enter domains or HTTP(S) URLs. Add -d to delete.\n').split()
             except EOFError:
                 raise ToolError('No input entries; supply addresses or --file') from None
             args.delete = args.delete or '-d' in entries
             args.sites = [entry for entry in entries if entry != '-d']
             if not args.sites:
                 return 0
-        sites = normalize_sites(args.sites)
+        sites = normalize_sites(args.sites, allow_urls=interactive)
+        operation = 'Connect to RouterOS'
         api = connect_router(args)
+        operation = 'Read address list'
         rows = read_address_list(api, args.addr_list)
         if args.list:
             for row in rows:
@@ -397,10 +424,12 @@ def main(argv=None):
                         (row['.id'], row_address(row)) for row in fresh_plan}:
                     raise ToolError('Cleanup plan changed; review a new dry-run before retrying')
                 plan = fresh_plan
+            operation = 'Remove entries'
             status = remove_entries(api, plan, args)
             if args.delete and dynamic:
                 status = 1
         else:
+            operation = 'Add entries'
             status = add_sites(api, sites, rows, args)
     except ToolError as exc:
         LOG.error('%s', exc)
@@ -409,8 +438,7 @@ def main(argv=None):
         LOG.warning('Interrupted; previously applied changes are not rolled back')
         status = 130
     except Exception as exc:
-        LOG.error('Operation failed (%s); changes may have been partially applied. Re-read the list before retrying',
-                  type(exc).__name__)
+        LOG.error('%s failed (%s)', operation, type(exc).__name__)
         status = 1
     finally:
         if api is not None:
@@ -423,5 +451,41 @@ def main(argv=None):
     return status
 
 
+def restore_windows_console():
+    if os.name != 'nt' or all(stream is not None for stream in (sys.stdin, sys.stdout, sys.stderr)):
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    if not kernel32.GetConsoleCP() and not kernel32.AllocConsole():
+        raise ctypes.WinError(ctypes.get_last_error())
+    if sys.stdin is None:
+        sys.stdin = open('CONIN$', 'r', encoding='utf-8')
+    if sys.stdout is None:
+        sys.stdout = open('CONOUT$', 'w', encoding='utf-8', buffering=1)
+    if sys.stderr is None:
+        sys.stderr = open('CONOUT$', 'w', encoding='utf-8', buffering=1, errors='backslashreplace')
+
+
+def cli(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        if not argv:
+            restore_windows_console()
+        status = main(argv)
+    except KeyboardInterrupt:
+        status = 130
+    except Exception as exc:
+        print(f'Startup failed ({type(exc).__name__})', file=sys.stderr)
+        status = 1
+    pause = not argv and sys.stdin is not None and sys.stdout is not None and sys.stdin.isatty() and sys.stdout.isatty()
+    if pause and status != 130:
+        try:
+            input('Press Enter to exit...')
+        except (EOFError, KeyboardInterrupt):
+            pass
+    return status
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(cli())

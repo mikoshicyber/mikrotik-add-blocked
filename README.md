@@ -10,7 +10,7 @@ A command-line utility for managing IPv4 firewall address lists in MikroTik Rout
 - `librouteros==4.2.2`, installed from `requirements.txt`.
 - RouterOS 6.43 or newer as the intended authentication baseline; validate against your exact RouterOS release before deployment.
 - A dedicated RouterOS account with the minimum required API and read/write permissions. Use a read-only account for listing or preview-only jobs where possible.
-- A reachable `api-ssl` service with a trusted certificate (TCP 8729 by default). Restrict access to the management network and authorized source addresses.
+- A reachable `api` service (TCP 8728 by default), or `api-ssl` with a trusted certificate (TCP 8729). Restrict access to the management network and authorized source addresses.
 
 ## Installation
 
@@ -40,13 +40,14 @@ password =
 
 Provide the actual password through a protected configuration file or the `ADD_BLOCKED_PASSWORD` environment variable injected by a secret manager or scheduler. The three environment variables `ADD_BLOCKED_HOST`, `ADD_BLOCKED_USER` and `ADD_BLOCKED_PASSWORD` override their respective INI values, including empty values. All three settings must be non-empty. Credentials must be ASCII; the host must be a hostname or IP address without a port or URL scheme. Passwords are not interpolated. On POSIX, a configuration file containing a password must not grant any group or other permissions (use `chmod 600`). Do not commit secrets or print the environment in CI. On Windows, restrict file access with ACLs.
 
-The default connection uses verified TLS. For a private CA, supply its trusted certificate:
+The default connection uses the original unencrypted RouterOS API (TCP 8728). No SSL configuration is required. Use it only on a trusted, restricted management network because credentials are transmitted without encryption. To enable verified TLS, use `--api-ssl`. For a private CA, supply its trusted certificate:
 
 ```bash
+python add_blocked.py --api-ssl --list
 python add_blocked.py --api-ca-file /path/to/ca.pem --list
 ```
 
-The certificate must match the configured host. If the host is an IP address, the certificate must contain the corresponding IP SAN. For existing deployments with only the legacy API enabled, explicitly use `--api-plain` (TCP 8728). This transmits credentials without encryption; use only on a trusted, restricted management network. `--insecure` affects HTTPS source downloads only, not RouterOS TLS.
+The certificate must match the configured host. If the host is an IP address, the certificate must contain the corresponding IP SAN. `--api-ca-file` also enables TLS. `--api-plain` explicitly selects the default unencrypted API. There is no automatic fallback from TLS to plain API. `--insecure` affects HTTPS source downloads only, not RouterOS TLS.
 
 ## Usage
 
@@ -72,13 +73,17 @@ example.net
 203.0.113.10-203.0.113.20
 ```
 
-Blank lines and full-line `#` comments are ignored. Local files use UTF-8 (BOM accepted); HTTP(S) sources use the declared charset or UTF-8. Invalid input aborts before router writes. Names are lowercased, a final DNS dot is removed, internationalized names are converted using Python's built-in IDNA codec, and IPv4 networks are normalized to their network address (a `/32` becomes a single IP). Duplicates are removed while preserving input order. IPv6, URLs as entries, wildcard domains and hosts-file syntax are not supported. The script does not create firewall rules; an existing firewall rule must reference the list to enforce filtering.
+Blank lines and full-line `#` comments are ignored. Local files use UTF-8 (BOM accepted); HTTP(S) sources use the declared charset or UTF-8. Invalid input aborts before router writes. Names are lowercased, a final DNS dot is removed, internationalized names are converted using Python's built-in IDNA codec, and IPv4 networks are normalized to their network address (a `/32` becomes a single IP). Duplicates are removed while preserving input order. IPv6, URLs in positional arguments or input files, wildcard domains and hosts-file syntax are not supported. The script does not create firewall rules; an existing firewall rule must reference the list to enforce filtering.
 
-Without entries or a file, add/delete mode prompts for a single line of space-separated addresses, including when standard input is redirected. Enter `example.org example.net` to add entries or `-d example.org example.net` to delete them. An empty line exits successfully; end-of-file without input exits with status 1. For example:
+Without entries or a file, add/delete mode prompts for a single line of space-separated addresses or absolute HTTP(S) URLs, including when standard input is redirected. Enter `example.org https://www.example.net:8443/path?q=1#section` to add `example.org` and `www.example.net`, or prefix the line with `-d` to delete them. Only the hostname is used; the scheme, port, path, query and fragment are discarded. URLs with credentials and malformed URLs are rejected. Entered URLs are not downloaded; use `--file URL` to download a list. An empty line exits successfully; end-of-file without input exits with status 1. For example:
 
 ```bash
 python add_blocked.py
 ```
+
+When launched without arguments in an interactive terminal, the program waits for Enter after completion, including errors. Ctrl+C during processing exits without this pause. Invocations with arguments and redirected standard input or output do not pause; the original exit status is preserved.
+
+On Windows, double-click `add_blocked.py` directly using Python 3.10 or newer. No CMD launcher is required. If Python starts without standard console streams, the script restores the missing streams and allocates a console when necessary. A Windows launch without arguments reads the default `add_blocked.conf` from the script directory; invocations with arguments retain the working-directory default unless `--config` is supplied. If the file association prevents Python itself from starting, the script cannot repair it.
 
 An empty file exits successfully without connecting. `--list`, `--delete` and `--clean` are mutually exclusive; listing and cleanup do not accept input entries.
 
@@ -103,8 +108,9 @@ An empty file exits successfully without connecting. `--list`, `--delete` and `-
 | `--insecure` | off | Disable HTTPS source certificate validation; not recommended |
 | `--config` | `add_blocked.conf` | INI file path |
 | `--api-timeout` | `10` | RouterOS socket timeout, seconds |
-| `--api-port` | `8729` / `8728` | Override TLS / plain API port |
-| `--api-plain` | off | Explicitly allow unencrypted RouterOS API |
+| `--api-port` | `8728` / `8729` | Override plain API / TLS port |
+| `--api-plain` | off | Explicitly select the default unencrypted API |
+| `--api-ssl` | off | Enable verified RouterOS TLS |
 | `--api-ca-file` | system trust | CA file for RouterOS TLS |
 | `--debug` | off | Verbose diagnostic logging |
 | `-h, --help` | — | Help |
@@ -117,7 +123,7 @@ Cleanup retains the original heuristic: a valid static DNS name is a candidate w
 
 ## Production operation
 
-- Use verified TLS for both the router and source downloads. HTTP and insecure HTTPS are explicit compatibility options; HTTPS-to-HTTP redirects are rejected. Restrict network egress and trust the input source; URLs are operator-controlled and not suitable for untrusted multi-tenant input.
+- For untrusted networks, use `--api-ssl` with verified TLS. Use verified HTTPS for source downloads. HTTP and insecure HTTPS are explicit compatibility options; HTTPS-to-HTTP redirects are rejected. Restrict network egress and trust the input source; URLs are operator-controlled and not suitable for untrusted multi-tenant input.
 - Sources are limited to 16 MiB and 100000 input entries; target list processing is limited to 100000 rows. The library can buffer a router reply before the application checks the limit. Keep router lists and feeds within operational limits.
 - DNS checks run on the client, not the router, and only when enabled. Each lookup runs in a subprocess with its own timeout. Process startup and system DNS/network behavior may add overhead. Source and API timeouts are socket timeouts, not total job deadlines.
 - Serialize jobs targeting the same router/list, including other writers. Idempotency applies to a read snapshot; concurrent writers or router reboots can invalidate it. Use an external lock and execution deadline, for example on Linux with a private writable lock directory:
