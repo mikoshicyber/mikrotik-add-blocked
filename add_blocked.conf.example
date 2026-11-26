@@ -1,0 +1,4 @@
+[credentials]
+host = router.example.org
+user = address-list-service
+password =
